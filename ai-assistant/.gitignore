@@ -27,8 +27,7 @@ logs/reports_*.json
 *.log
 
 # Data & Models (large files)
-data/crawled/
-data/vector_store/
+data/
 models/
 
 # Backups & Temp
