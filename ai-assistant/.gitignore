@@ -1,0 +1,72 @@
+# AI Assistant Project Structure
+# エクスプローラーで見づらくならないように、開発に不要なファイルは非表示
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.python-version
+venv/
+.venv/
+env/
+ENV/
+
+# Logs (only keep recent)
+logs/*.log
+logs/reports_*.json
+*.log
+
+# Data & Models (large files)
+data/crawled/
+data/vector_store/
+models/
+
+# Backups & Temp
+backups/
+*.bak
+tmp/
+temp/
+
+# Auto-edit artifacts (only keep proposals directory)
+auto_edits/patches/
+auto_edits/*.patch
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE temporary files
+*.sublime-workspace
+*.sublime-project
+
+# OS
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Generated files (keep source only)
+*.compiled
+*.pyc
+*.pyo
+
+# Keep but don't clutter explorer
+idle.pid
+data/worker.pid
+data/monitor.pid
+data/IDLE_MODE
+data/STOP
+
+# Web output (regenerated)
+web_ui.html
