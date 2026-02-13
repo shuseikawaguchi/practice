@@ -158,11 +158,20 @@ class Config:
     OCR_UPSCALE_MIN_WIDTH = 900
     OCR_WATCH_ENABLED = os.getenv("AI_ASSISTANT_OCR_WATCH_ENABLED", "1") == "1"
     OCR_WATCH_INTERVAL_SECONDS = int(os.getenv("AI_ASSISTANT_OCR_WATCH_INTERVAL_SECONDS", "60"))
+    OCR_WATCH_CAPTURE_SCREEN = os.getenv("AI_ASSISTANT_OCR_WATCH_CAPTURE_SCREEN", "1") == "1"
+    # capture backend: auto|mss|pyautogui|adb
+    OCR_WATCH_CAPTURE_BACKEND = os.getenv("AI_ASSISTANT_OCR_WATCH_CAPTURE_BACKEND", "auto")
+    # adb device id for adb backend (optional)
+    OCR_WATCH_ADB_DEVICE = os.getenv("AI_ASSISTANT_OCR_WATCH_ADB_DEVICE", "")
+    # target fps for live capture when using continuous capture (affects interval)
+    OCR_WATCH_CAPTURE_FPS = float(os.getenv("AI_ASSISTANT_OCR_WATCH_CAPTURE_FPS", "1.0"))
     OCR_WATCH_DIRS = [
         DATA_DIR / "screenshots",
         DATA_DIR / "uploads",
     ]
     OCR_WATCH_STATE_FILE = DATA_DIR / "ocr_watch_state.json"
+    # persistent config for OCR watch (auto-start)
+    OCR_WATCH_CONFIG_FILE = DATA_DIR / "ocr_watch_config.json"
     LOCAL_DOC_MAX_FILES = 10000
     LOCAL_DOC_MAX_CHARS = 120000
     LOCAL_DOC_INGEST_MIN_INTERVAL_SECONDS = 1800

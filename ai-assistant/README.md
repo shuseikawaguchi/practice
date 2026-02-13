@@ -98,6 +98,15 @@ pip install -r requirements.txt
 
 ## 📖 使い方
 
+### UIサーバーを自動反映で起動（推奨）
+
+```bash
+./scripts/run_api_dev.sh
+```
+
+- `api.py` や関連ファイルを更新すると自動で再起動されます
+- これにより、毎回手動で `uvicorn` 再起動する必要がありません
+
 ### インタラクティブチャットモード
 
 ```bash

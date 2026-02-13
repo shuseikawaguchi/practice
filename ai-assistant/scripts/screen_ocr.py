@@ -16,7 +16,10 @@ import json
 import threading
 import time
 import difflib
+import hashlib
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Tuple, List
 
 import cv2
@@ -24,6 +27,11 @@ import numpy as np
 import pyautogui
 import pytesseract
 import requests
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 Region = Optional[Tuple[int, int, int, int]]  # (left, top, width, height)
@@ -113,6 +121,36 @@ def summarize_with_ollama_stream(text: str, model: str, url: str) -> None:
     print()
 
 
+def learn_from_text(text: str, rebuild: bool = False) -> dict:
+    content = (text or "").strip()
+    if not content:
+        return {"ok": False, "reason": "empty_text"}
+
+    try:
+        from config import Config
+        from src.utils.local_doc_ingest import build_vector_store_from_clean
+    except Exception as e:
+        return {"ok": False, "reason": f"import_failed: {e}"}
+
+    try:
+        clean_dir = Config.DATA_DIR / "clean"
+        clean_dir.mkdir(parents=True, exist_ok=True)
+
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        out = clean_dir / f"screen_{digest}.txt"
+
+        if out.exists():
+            return {"ok": True, "saved": False, "clean_file": str(out), "reason": "already_exists"}
+
+        out.write_text(content, encoding="utf-8")
+        result = {"ok": True, "saved": True, "clean_file": str(out)}
+        if rebuild:
+            result["vector_store"] = build_vector_store_from_clean()
+        return result
+    except Exception as e:
+        return {"ok": False, "reason": f"save_failed: {e}"}
+
+
 def parse_region(raw: Optional[str]) -> Region:
     if not raw:
         return None
@@ -140,6 +178,9 @@ def main() -> None:
     parser.add_argument("--similarity", type=float, default=0.8)
     parser.add_argument("--once", action="store_true", help="single capture")
     parser.add_argument("--summary", action="store_true", help="summarize via Ollama")
+    parser.add_argument("--learn", action="store_true", help="save OCR text to learning corpus")
+    parser.add_argument("--learn-rebuild", action="store_true", help="rebuild vector store after learning")
+    parser.add_argument("--learn-min-chars", type=int, default=40, help="minimum chars required to learn")
     parser.add_argument("--model", default="qwen2.5", help="Ollama model")
     parser.add_argument("--ollama-url", default="http://localhost:11434/api/generate")
     args = parser.parse_args()
@@ -151,6 +192,9 @@ def main() -> None:
         print(text)
         if args.summary and text:
             summarize_with_ollama_stream(text, model=args.model, url=args.ollama_url)
+        if args.learn and len(text) >= max(1, int(args.learn_min_chars)):
+            learned = learn_from_text(text, rebuild=bool(args.learn_rebuild))
+            print(f"[LEARN] {learned}")
         return
 
     ocr = AdvancedScreenOCR(
@@ -172,6 +216,13 @@ def main() -> None:
                 print("=" * 40)
     except KeyboardInterrupt:
         ocr.stop()
+        final_text = (ocr.get_full_text() or "").strip()
+        if args.learn:
+            if len(final_text) >= max(1, int(args.learn_min_chars)):
+                learned = learn_from_text(final_text, rebuild=bool(args.learn_rebuild))
+                print(f"[LEARN] {learned}")
+            else:
+                print(f"[LEARN] skipped: text too short ({len(final_text)} chars)")
 
 
 if __name__ == "__main__":

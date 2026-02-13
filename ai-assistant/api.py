@@ -5,6 +5,8 @@ from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, F
 import threading
 import time
 import shutil
+import json
+import hashlib
 from pathlib import Path
 import os
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -24,7 +26,7 @@ from src.utils.rss_collector import collect_from_sources as rss_collect
 from src.utils.local_doc_ingest import ingest_local_docs_to_clean
 from src.utils.local_doc_ingest import build_vector_store_from_clean
 from src.utils.local_doc_ingest import load_local_docs_state
-from src.utils.local_doc_ingest import process_image_for_learning
+from src.utils.local_doc_ingest import ocr_image_file
 from src.utils.local_doc_ingest import ingest_images_from_dirs
 from src.utils.provider_selector import get_provider_status
 from src.utils.provider_selector import record_provider_score
@@ -44,6 +46,7 @@ _chat_topics: dict[str, dict] = {}
 _chat_topic_order: list[str] = []
 _chat_topic_counter = 0
 _chat_lock = threading.Lock()
+_chat_state_file = Config.DATA_DIR / "chat_topics_state.json"
 index_state = {
     "running": False,
     "last_result": None,
@@ -77,6 +80,127 @@ ocr_watch_state = {
     "updated_at": None,
 }
 _ocr_watch_thread = None
+
+
+def _load_ocr_watch_config() -> dict:
+    try:
+        p = Config.OCR_WATCH_CONFIG_FILE
+        if p.exists():
+            import json
+            return json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        pass
+    return {"auto_start": False}
+
+
+def _save_ocr_watch_config(cfg: dict):
+    try:
+        p = Config.OCR_WATCH_CONFIG_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        import json
+        p.write_text(json.dumps(cfg, ensure_ascii=False), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _start_ocr_watch_background():
+    global _ocr_watch_thread
+    if ocr_watch_state.get("running"):
+        return {"started": False, "reason": "already_running"}
+    ocr_watch_state["running"] = True
+    ocr_watch_state["last_error"] = None
+    ocr_watch_state["updated_at"] = int(time.time())
+
+    def _loop():
+        while ocr_watch_state.get("running"):
+            try:
+                capture = {"ok": False, "skipped": True}
+                if getattr(Config, "OCR_WATCH_CAPTURE_SCREEN", True):
+                    capture = _capture_screen_for_ocr_watch()
+                res = ingest_images_from_dirs(Config.OCR_WATCH_DIRS, rebuild=False)
+                res["capture"] = capture
+                ocr_watch_state["last_result"] = res
+                if capture.get("ok"):
+                    ocr_watch_state["last_error"] = None
+                elif not capture.get("skipped"):
+                    prev = ocr_watch_state.get("last_error") or ""
+                    ocr_watch_state["last_error"] = prev + ("; " if prev else "") + f"capture_failed: {capture.get('error', 'unknown_error')}"
+            except Exception as e:
+                ocr_watch_state["last_error"] = str(e)
+            ocr_watch_state["updated_at"] = int(time.time())
+            # interval influenced by capture fps
+            fps = float(getattr(Config, "OCR_WATCH_CAPTURE_FPS", 1.0) or 1.0)
+            wait = max(0.1, 1.0 / max(0.001, fps))
+            time.sleep(max(0.1, min(max(5, int(Config.OCR_WATCH_INTERVAL_SECONDS or 60)), wait)))
+
+    _ocr_watch_thread = threading.Thread(target=_loop, daemon=True)
+    _ocr_watch_thread.start()
+    return {"started": True, "state": ocr_watch_state}
+
+
+def _capture_screen_for_ocr_watch() -> dict:
+    # Support multiple backends: mss (fast), pyautogui (fallback), adb (android)
+    capture_dir = Config.DATA_DIR / "screenshots"
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    capture_file = capture_dir / "live_capture.png"
+    backend = getattr(Config, "OCR_WATCH_CAPTURE_BACKEND", "auto") or "auto"
+    tried = []
+    def _use_pyautogui():
+        try:
+            import pyautogui
+            shot = pyautogui.screenshot()
+            shot.save(capture_file)
+            return {"ok": True, "file": str(capture_file), "backend": "pyautogui"}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "backend": "pyautogui"}
+
+    def _use_mss():
+        try:
+            import mss
+            from PIL import Image
+            with mss.mss() as s:
+                monitor = s.monitors[0]
+                sshot = s.grab(monitor)
+                img = Image.frombytes("RGB", sshot.size, sshot.rgb)
+                img.save(capture_file)
+            return {"ok": True, "file": str(capture_file), "backend": "mss"}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "backend": "mss"}
+
+    def _use_adb():
+        try:
+            import subprocess
+            device = getattr(Config, "OCR_WATCH_ADB_DEVICE", "")
+            cmd = ["adb"]
+            if device:
+                cmd += ["-s", device]
+            cmd += ["exec-out", "screencap", "-p"]
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = p.communicate(timeout=10)
+            if p.returncode != 0:
+                return {"ok": False, "error": err.decode("utf-8", errors="ignore"), "backend": "adb"}
+            with open(capture_file, "wb") as f:
+                f.write(out)
+            return {"ok": True, "file": str(capture_file), "backend": "adb"}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "backend": "adb"}
+
+    # selection logic
+    if backend == "mss":
+        return _use_mss()
+    if backend == "pyautogui":
+        return _use_pyautogui()
+    if backend == "adb":
+        return _use_adb()
+    # auto: prefer mss, then pyautogui, then adb
+    for fn in (_use_mss, _use_pyautogui, _use_adb):
+        res = fn()
+        tried.append(res.get("backend"))
+        if res.get("ok"):
+            res["tried"] = tried
+            return res
+    # none worked
+    return {"ok": False, "error": "no_backend_available", "tried": tried}
 
 def _safe_path(rel_path: str) -> Path:
     base = Config.BASE_DIR.resolve()
@@ -128,9 +252,13 @@ class ChatSendRequest(BaseModel):
     message: str
     topic_id: str | None = None
     force_new: bool = False
+    user_action: bool = False
 
 class ChatTopicRequest(BaseModel):
     topic_id: str
+
+class ChatNewRequest(BaseModel):
+    user_action: bool = False
 
 class ChatTopicRenameRequest(BaseModel):
     topic_id: str
@@ -298,8 +426,95 @@ def _check_token(x_api_key: str = None):
 
 def _new_topic_id() -> str:
     global _chat_topic_counter
-    _chat_topic_counter += 1
-    return f"t{int(time.time())}_{_chat_topic_counter}"
+    used_suffixes = set()
+    for tid in _chat_topics.keys():
+        try:
+            part = str(tid).rsplit("_", 1)
+            if len(part) == 2 and part[1].isdigit():
+                n = int(part[1])
+                if n > 0:
+                    used_suffixes.add(n)
+        except Exception:
+            continue
+
+    next_suffix = 1
+    while next_suffix in used_suffixes:
+        next_suffix += 1
+
+    _chat_topic_counter = next_suffix
+    return f"t{int(time.time())}_{next_suffix}"
+
+def _save_chat_topics_state():
+    try:
+        payload = {
+            "counter": int(_chat_topic_counter),
+            "order": list(_chat_topic_order),
+            "topics": _chat_topics,
+        }
+        _chat_state_file.parent.mkdir(parents=True, exist_ok=True)
+        serialized = json.dumps(payload, ensure_ascii=False, default=str)
+        _chat_state_file.write_text(serialized, encoding="utf-8")
+    except Exception:
+        pass
+
+def _load_chat_topics_state():
+    global _chat_topics, _chat_topic_order, _chat_topic_counter
+    try:
+        if not _chat_state_file.exists():
+            return
+        data = json.loads(_chat_state_file.read_text(encoding="utf-8"))
+        topics = data.get("topics") if isinstance(data, dict) else {}
+        order = data.get("order") if isinstance(data, dict) else []
+        counter = data.get("counter") if isinstance(data, dict) else 0
+        if not isinstance(topics, dict):
+            topics = {}
+        if not isinstance(order, list):
+            order = []
+
+        now_ts = time.time()
+        normalized = {}
+        for tid, topic in topics.items():
+            if not isinstance(topic, dict):
+                continue
+            messages = topic.get("messages")
+            if not isinstance(messages, list):
+                messages = []
+            created_at = topic.get("created_at")
+            updated_at = topic.get("updated_at")
+            try:
+                created_at = float(created_at)
+            except Exception:
+                created_at = now_ts
+            try:
+                updated_at = float(updated_at)
+            except Exception:
+                updated_at = created_at
+            normalized[str(tid)] = {
+                "id": str(topic.get("id") or tid),
+                "title": str(topic.get("title") or "新しい話題"),
+                "messages": messages,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }
+
+        restored_order = [str(tid) for tid in order if str(tid) in normalized]
+        for tid in normalized.keys():
+            if tid not in restored_order:
+                restored_order.append(tid)
+
+        _chat_topics = normalized
+        _chat_topic_order = restored_order
+
+        try:
+            _chat_topic_counter = int(counter)
+        except Exception:
+            _chat_topic_counter = 0
+        if _chat_topic_counter < 0:
+            _chat_topic_counter = 0
+    except Exception:
+        _chat_topics = {}
+        _chat_topic_order = []
+        _chat_topic_counter = 0
 
 def _truncate_title(text: str, limit: int = 24) -> str:
     if not text:
@@ -319,6 +534,7 @@ def _create_topic(title: str | None = None) -> dict:
     }
     _chat_topics[topic_id] = topic
     _chat_topic_order.insert(0, topic_id)
+    _save_chat_topics_state()
     return topic
 
 def _touch_topic(topic: dict):
@@ -327,6 +543,7 @@ def _touch_topic(topic: dict):
     if tid in _chat_topic_order:
         _chat_topic_order.remove(tid)
     _chat_topic_order.insert(0, tid)
+    _save_chat_topics_state()
 
 def _list_topics() -> list[dict]:
     topics = []
@@ -342,8 +559,11 @@ def _delete_topic(topic_id: str) -> bool:
         _chat_topics.pop(topic_id, None)
         if topic_id in _chat_topic_order:
             _chat_topic_order.remove(topic_id)
+        _save_chat_topics_state()
         return True
     return False
+
+_load_chat_topics_state()
 
 @app.post("/api/query")
 async def query_rag(q: Query, x_api_key: str = Header(default=None)):
@@ -355,19 +575,17 @@ async def query_rag(q: Query, x_api_key: str = Header(default=None)):
 @app.post("/api/chat")
 async def chat(q: Chat, x_api_key: str = Header(default=None)):
     _check_token(x_api_key)
-    with _chat_lock:
-        topic = _create_topic(_truncate_title(q.message))
-        prev_history = list(assistant.llm.conversation_history)
-        assistant.llm.conversation_history = []
-        resp = assistant.llm.chat(q.message)
-        topic["messages"] = list(assistant.llm.conversation_history)
-        assistant.llm.conversation_history = prev_history
-        _touch_topic(topic)
-        return {"response": resp, "topic": {"id": topic["id"], "title": topic["title"]}, "topics": _list_topics()}
+    message = (q.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    resp = assistant.llm.chat(message)
+    return {"response": resp, "topic": None, "topics": _list_topics()}
 
 @app.post("/api/chat/new")
-async def chat_new(x_api_key: str = Header(default=None)):
+async def chat_new(req: ChatNewRequest, x_api_key: str = Header(default=None)):
     _check_token(x_api_key)
+    if not req.user_action:
+        raise HTTPException(status_code=400, detail="explicit user_action=true is required")
     with _chat_lock:
         topic = _create_topic()
         return {"topic": {"id": topic["id"], "title": topic["title"]}, "topics": _list_topics()}
@@ -412,6 +630,8 @@ async def chat_delete(req: ChatTopicRequest, x_api_key: str = Header(default=Non
 @app.post("/api/chat/send")
 async def chat_send(req: ChatSendRequest, x_api_key: str = Header(default=None)):
     _check_token(x_api_key)
+    if not req.user_action:
+        raise HTTPException(status_code=400, detail="explicit user_action=true is required")
     if not req.message:
         raise HTTPException(status_code=400, detail="message is required")
     with _chat_lock:
@@ -544,11 +764,13 @@ async def mobile_ui():
             letter-spacing:0.8px;
             text-shadow: 0 0 12px rgba(72,240,255,0.45);
         }
-        :root[data-theme="cockpit"] .tab {
+        :root[data-theme="cockpit"] .menu-group-btn,
+        :root[data-theme="cockpit"] .subtab {
             border-color: rgba(72,240,255,0.25);
             box-shadow: inset 0 0 12px rgba(72,240,255,0.08);
         }
-        :root[data-theme="cockpit"] .tab.active {
+        :root[data-theme="cockpit"] .menu-group-btn.active,
+        :root[data-theme="cockpit"] .subtab.active {
             border-color: var(--accent);
             color: var(--accent);
             text-shadow: 0 0 10px rgba(72,240,255,0.6);
@@ -619,16 +841,25 @@ async def mobile_ui():
             position:sticky; top:0; z-index:2; border-bottom:1px solid #1c2438;
         }
         header h1 { font-size:16px; margin:0; letter-spacing:0.3px; }
-        .tabs {
-            display:flex; gap:8px; padding:10px 16px; overflow-x:auto;
+        .nav-wrap {
+            padding:10px 16px;
             background:linear-gradient(180deg, rgba(15,22,41,0.9), rgba(15,22,41,0));
+            border-bottom:1px solid #1c2438;
         }
-        .tab {
+        .menu-groups, .subtabs {
+            display:flex; gap:8px; overflow-x:auto; -webkit-overflow-scrolling: touch;
+            scrollbar-width: thin;
+        }
+        .menu-groups { margin-bottom:8px; }
+        .menu-group-btn, .subtab {
             padding:8px 12px; border-radius:999px; background:rgba(18,26,43,0.85); color:var(--text);
-            font-size:12px; border:1px solid #1c2438; cursor:pointer; -webkit-tap-highlight-color: transparent;
-            transition:all .2s ease; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+            font-size:12px; border:1px solid #1c2438; cursor:pointer; white-space:nowrap;
+            -webkit-tap-highlight-color: transparent; transition:all .2s ease;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
         }
-        .tab.active { border-color:var(--accent); color:var(--accent); box-shadow:var(--glow); }
+        .menu-group-btn.active, .subtab.active { border-color:var(--accent); color:var(--accent); box-shadow:var(--glow); }
+        .subtab.hidden { display:none; }
+        .nav-hint { font-size:11px; color:var(--muted); margin-top:4px; }
         .container { padding:12px 16px 150px; }
         .panel {
             display:none; background:rgba(18,26,43,0.9); border:1px solid #1c2438; border-radius:16px;
@@ -658,6 +889,7 @@ async def mobile_ui():
         .ai { align-self:flex-start; background:#192033; }
         .footer { position:fixed; bottom:0; left:0; right:0; background:#0f1629; padding:10px; border-top:1px solid #1c2438; }
         .dock { display:flex; flex-direction:column; gap:10px; max-height:45vh; overflow:auto; padding-bottom:4px; }
+        .dock.hidden { display:none; }
         .dock button { padding:14px 16px; font-size:16px; border-radius:14px; }
         .dock .row { display:flex; gap:8px; }
         .dock .row.two-col { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
@@ -665,6 +897,17 @@ async def mobile_ui():
         .dock .row.two-col button, .dock .row.three-col button { width:100%; }
         .dock input, .dock textarea, .dock select { width:100%; }
         .muted { color:var(--muted); font-size:12px; }
+        .marker-wrap { display:flex; align-items:center; gap:8px; margin-top:6px; flex-wrap:wrap; }
+        .marker {
+            display:inline-flex; align-items:center; gap:6px;
+            padding:6px 10px; border-radius:999px; font-size:12px; font-weight:700;
+            border:1px solid #1c2438; background:#0f1629; color:var(--text);
+        }
+        .marker::before { content:''; width:8px; height:8px; border-radius:50%; display:inline-block; }
+        .marker-ok::before { background:#22c55e; }
+        .marker-busy::before { background:#f59e0b; }
+        .marker-warn::before { background:#94a3b8; }
+        .marker-err::before { background:#ef4444; }
         .quick { display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; }
         .chip { padding:8px 10px; border-radius:999px; background:#0f1629; border:1px solid #1c2438; font-size:12px; }
     </style>
@@ -672,30 +915,42 @@ async def mobile_ui():
 <body>
     <header><h1>AI Assistant Mobile</h1></header>
 
-    <div class=\"tabs\">
-        <div class=\"tab active\" data-tab=\"chat\">チャット</div>
-        <div class=\"tab\" data-tab=\"gen\">生成</div>
-        <div class=\"tab\" data-tab=\"idle\">自己改善</div>
-        <div class=\"tab\" data-tab=\"summary\">サマリ</div>
-        <div class=\"tab\" data-tab=\"status\">状態</div>
-        <div class=\"tab\" data-tab=\"collect\">情報収集</div>
-        <div class=\"tab\" data-tab=\"local\">ローカル/OCR</div>
-        <div class=\"tab\" data-tab=\"browser\">ブラウザ</div>
-        <div class=\"tab\" data-tab=\"index\">索引</div>
-        <div class=\"tab\" data-tab=\"quality\">品質</div>
-        <div class=\"tab\" data-tab=\"search\">検索</div>
-        <div class=\"tab\" data-tab=\"ide\">IDE</div>
-        <div class=\"tab\" data-tab=\"patch\">修正</div>
-        <div class=\"tab\" data-tab=\"feature\">追加機能</div>
-        <div class=\"tab\" data-tab=\"logs\">ログ</div>
-        <div class=\"tab\" data-tab=\"dash\">ダッシュボード</div>
+    <div class=\"nav-wrap\">
+        <div class=\"menu-groups\" id=\"menuGroups\">
+            <button class=\"menu-group-btn active\" data-group=\"assistant\">会話・生成</button>
+            <button class=\"menu-group-btn\" data-group=\"learning\">学習・収集</button>
+            <button class=\"menu-group-btn\" data-group=\"automation\">自動操作</button>
+            <button class=\"menu-group-btn\" data-group=\"devops\">開発・運用</button>
+        </div>
+        <div class=\"subtabs\" id=\"subTabs\">
+            <button class=\"subtab active\" data-group=\"assistant\" data-tab=\"chat\">チャット</button>
+            <button class=\"subtab\" data-group=\"assistant\" data-tab=\"gen\">文章/コード生成</button>
+            <button class=\"subtab\" data-group=\"assistant\" data-tab=\"summary\">学習サマリ</button>
+
+            <button class=\"subtab\" data-group=\"learning\" data-tab=\"local\">画像OCRと学習</button>
+            <button class=\"subtab\" data-group=\"learning\" data-tab=\"collect\">RSS収集</button>
+            <button class=\"subtab\" data-group=\"learning\" data-tab=\"idle\">自己改善</button>
+            <button class=\"subtab\" data-group=\"learning\" data-tab=\"status\">稼働状態</button>
+
+            <button class=\"subtab\" data-group=\"automation\" data-tab=\"browser\">ブラウザ操作</button>
+
+            <button class=\"subtab\" data-group=\"devops\" data-tab=\"index\">索引作成</button>
+            <button class=\"subtab\" data-group=\"devops\" data-tab=\"quality\">品質チェック</button>
+            <button class=\"subtab\" data-group=\"devops\" data-tab=\"search\">検索</button>
+            <button class=\"subtab\" data-group=\"devops\" data-tab=\"ide\">コード支援</button>
+            <button class=\"subtab\" data-group=\"devops\" data-tab=\"patch\">パッチ承認</button>
+            <button class=\"subtab\" data-group=\"devops\" data-tab=\"feature\">機能提案</button>
+            <button class=\"subtab\" data-group=\"devops\" data-tab=\"logs\">ログ確認</button>
+            <button class=\"subtab\" data-group=\"devops\" data-tab=\"dash\">ダッシュボード</button>
+        </div>
+        <div class=\"nav-hint\">上段でカテゴリを選ぶ → 下段で機能を選ぶ</div>
     </div>
 
     <div class="container">
         <div id=\"chat\" class=\"panel active\">
             <div class=\"no-dock\">
                 <div class=\"row\">
-                    <button id=\"chatNewTopic\">新しい話題</button>
+                    <button id=\"chatNewTopic\">新しいチャットを作成</button>
                 </div>
                 <div class=\"muted\" style=\"margin-top:6px;\">話題一覧</div>
                 <div class=\"cards\" id=\"chatTopics\"></div>
@@ -703,7 +958,7 @@ async def mobile_ui():
             <div class=\"chat\" id=\"chatLog\"></div>
             <div class=\"row\" style=\"margin-top:10px;\">
                 <textarea id=\"chatInput\" rows=\"3\" placeholder=\"ここに質問を入力（改行可）\"></textarea>
-                <button id=\"chatSend\">送信</button>
+                <button id=\"chatSend\">メッセージを送信</button>
             </div>
             <div class=\"row\" style=\"margin-top:6px;\">
                 <label class=\"muted\"><input id=\"chatContinue\" type=\"checkbox\" /> 続きで送信</label>
@@ -718,30 +973,38 @@ async def mobile_ui():
                     <option value=\"ui\">UI生成</option>
                     <option value=\"3d\">3D生成</option>
                     <option value=\"summary\">要約</option>
-                    <option value=\"plan\">実装計画</option>
                 </select>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">目的に合わせて生成タイプを選択</div>
             <div class=\"row\" style=\"margin-top:8px;\">
-                <select id=\"codeLang\">
-                    <option value=\"python\">Python</option>
-                    <option value=\"javascript\">JavaScript</option>
-                    <option value=\"html\">HTML</option>
-                </select>
+                <textarea id=\"genInput\" rows=\"4\" placeholder=\"生成したい内容を入力\"></textarea>
+                <button id=\"genBtn\">生成を実行</button>
             </div>
-            <textarea id=\"genInput\" rows=\"4\" placeholder=\"生成したい内容\" style=\"margin-top:8px;\"></textarea>
-            <button id=\"genBtn\" style=\"margin-top:8px;\">生成を実行</button>
             <div class=\"result\" id=\"genOut\"></div>
+        </div>
+
+        <div id="logs" class="panel">
+            <div class="muted" style="margin-top:6px;">実行ログの表示と検索</div>
+            <div class="row" style="margin-top:8px;">
+                <input id="logLines" type="number" value="30" min="1" />
+                <input id="logFilter" placeholder="フィルタ(任意)" style="margin-left:6px;" />
+                <button id="logTail" style="margin-left:6px;">最新ログを表示</button>
+            </div>
+            <div class="row" style="margin-top:8px;">
+                <input id="logSearch" placeholder="検索キーワード" />
+                <button id="logSearchBtn" style="margin-left:6px;">ログを検索</button>
+            </div>
+            <div class="result" id="logOut"></div>
         </div>
 
         <div id=\"idle\" class=\"panel\">
             <div class=\"row two-col\">
-                <button id=\"idleStart\">自己改善開始</button>
-                <button id=\"idleStop\">自己改善停止</button>
+                <button id=\"idleStart\">自己改善を開始</button>
+                <button id=\"idleStop\">自己改善を停止</button>
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
-                <button id=\"idleStatus\">状態を取得</button>
-                <button id=\"idleRestart\">再起動</button>
+                <button id=\"idleStatus\">自己改善の状態を確認</button>
+                <button id=\"idleRestart\">自己改善を再起動</button>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">放置モード（自己改善）の開始/停止/状態確認</div>
             <div class=\"result\" id=\"idleOut\"></div>
@@ -750,8 +1013,8 @@ async def mobile_ui():
         <div id=\"summary\" class=\"panel\">
             <div class=\"row\">
                 <input id=\"summaryDays\" type=\"number\" value=\"7\" min=\"1\" />
-                <button id=\"summaryBtn\">日次を取得</button>
-                <button id=\"summaryAll\" style=\"margin-left:6px;\">全期間を取得</button>
+                <button id=\"summaryBtn\">日次サマリを表示</button>
+                <button id=\"summaryAll\" style=\"margin-left:6px;\">全期間サマリを表示</button>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">学習のサマリや変化を確認</div>
             <div class=\"cards\" id=\"summaryOut\"></div>
@@ -759,9 +1022,9 @@ async def mobile_ui():
 
         <div id=\"status\" class=\"panel\">
             <div class=\"row\">
-                <button id=\"statusBtn\">システム状態を取得</button>
-                <button id=\"healthBtn\" style=\"margin-left:6px;\">ヘルスチェック</button>
-                <button id=\"healBtn\" style=\"margin-left:6px;\">自動復旧</button>
+                <button id=\"statusBtn\">システム状態を表示</button>
+                <button id=\"healthBtn\" style=\"margin-left:6px;\">システム健全性を確認</button>
+                <button id=\"healBtn\" style=\"margin-left:6px;\">自動復旧を実行</button>
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
                 <select id=\"uiTheme\">
@@ -771,7 +1034,7 @@ async def mobile_ui():
                     <option value=\"mono\">モノクロ</option>
                     <option value=\"cockpit\">コックピット</option>
                 </select>
-                <button id=\"uiThemeApply\">テーマ適用</button>
+                <button id=\"uiThemeApply\">テーマを反映</button>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">UIテーマを切り替え</div>
             <div class=\"muted\" style=\"margin-top:6px;\">稼働/学習の状態を確認</div>
@@ -780,7 +1043,7 @@ async def mobile_ui():
             </div>
             <div class=\"result\" id=\"statusOut\"></div>
             <div class=\"row\" style=\"margin-top:12px;\">
-                <button id=\"providerStatus\">プロバイダ状態</button>
+                <button id=\"providerStatus\">利用中プロバイダを表示</button>
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
                 <input id=\"providerKind\" placeholder=\"種別 (llm/ocr)\" />
@@ -791,7 +1054,7 @@ async def mobile_ui():
                 <input id=\"providerNotes\" placeholder=\"メモ(任意)\" style=\"margin-left:6px;\" />
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
-                <button id=\"providerSave\">スコア登録</button>
+                <button id=\"providerSave\">プロバイダ評価を保存</button>
             </div>
             <div class=\"result\" id=\"providerOut\"></div>
         </div>
@@ -802,13 +1065,13 @@ async def mobile_ui():
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">RSSを追加/削除し、収集して学習に回す</div>
             <div class=\"row\" style=\"margin-top:8px;\">
-                <button id=\"rssAdd\">追加</button>
-                <button id=\"rssRemove\" style=\"margin-left:6px;\">削除</button>
-                <button id=\"rssList\" style=\"margin-left:6px;\">一覧</button>
+                <button id=\"rssAdd\">RSSを追加</button>
+                <button id=\"rssRemove\" style=\"margin-left:6px;\">RSSを削除</button>
+                <button id=\"rssList\" style=\"margin-left:6px;\">RSS一覧を表示</button>
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
                 <input id=\"rssMax\" type=\"number\" value=\"30\" min=\"1\" />
-                <button id=\"rssCollect\" style=\"margin-left:6px;\">収集してwatchlistへ</button>
+                <button id=\"rssCollect\" style=\"margin-left:6px;\">RSSを収集して学習候補に追加</button>
             </div>
             <div class=\"result\" id=\"rssOut\"></div>
         </div>
@@ -819,50 +1082,56 @@ async def mobile_ui():
                 <label class=\"muted\" style=\"margin-left:10px;\"><input id=\"localRebuild\" type=\"checkbox\" checked /> ベクトル再構築</label>
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
+                <label class=\"muted\"><input id=\"ocrSummary\" type=\"checkbox\" checked /> OCR後に要約</label>
+                <input id=\"ocrMinChars\" type=\"number\" min=\"1\" value=\"40\" placeholder=\"学習最小文字数\" style=\"margin-left:10px;\" />
+            </div>
+            <div class=\"row\" style=\"margin-top:8px;\">
                 <input id=\"ocrFile\" type=\"file\" accept=\"image/*\" />
             </div>
             <div class=\"row two-col\" style=\"margin-top:8px;\">
-                <button id=\"ocrUpload\">OCRして表示</button>
-                <button id=\"ocrUploadLearn\">OCRして学習</button>
+                <button id=\"ocrUpload\">OCRで文字を読み取る</button>
+                <button id=\"ocrUploadLearn\">OCR結果を学習に追加</button>
             </div>
             <div class=\"row two-col\" style=\"margin-top:8px;\">
-                <button id=\"localRun\">ローカル学習を実行</button>
-                <button id=\"localStatus\">状態</button>
+                <button id=\"localRun\">ローカル文書を学習に追加</button>
+                <button id=\"localStatus\">学習/OCRの状態を表示</button>
+                <button id=\"ocrRecent\" style=\"margin-left:6px;\">最近のOCR検出を表示</button>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">スクリーンショット/画像はOCRで文字化して学習</div>
             <div class=\"row three-col\" style=\"margin-top:8px;\">
-                <button id=\"ocrWatchStart\">監視開始</button>
-                <button id=\"ocrWatchStop\">監視停止</button>
-                <button id=\"ocrWatchStatus\">監視状態</button>
+                <button id=\"ocrWatchStart\">OCR監視を開始</button>
+                <button id=\"ocrWatchStop\">OCR監視を停止</button>
+                <button id=\"ocrWatchStatus\">OCR監視の状態を表示</button>
             </div>
+            <div id=\"localStateBoard\" class=\"cards\" style=\"margin-top:8px;\"></div>
             <div class=\"result\" id=\"localOut\"></div>
         </div>
 
         <div id=\"browser\" class=\"panel\">
             <div class=\"row\">
-                <button id=\"browserStart\">開始</button>
-                <button id=\"browserStop\" style=\"margin-left:6px;\">停止</button>
-                <button id=\"browserStatus\" style=\"margin-left:6px;\">状態</button>
+                <button id=\"browserStart\">ブラウザ操作を開始</button>
+                <button id=\"browserStop\" style=\"margin-left:6px;\">ブラウザ操作を停止</button>
+                <button id=\"browserStatus\" style=\"margin-left:6px;\">ブラウザ状態を表示</button>
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
                 <input id=\"browserUrl\" placeholder=\"https://example.com\" />
-                <button id=\"browserOpen\" style=\"margin-left:6px;\">開く</button>
+                <button id=\"browserOpen\" style=\"margin-left:6px;\">URLを開く</button>
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
                 <input id=\"browserSelector\" placeholder=\"CSSセレクタ\" />
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
-                <button id=\"browserClick\">クリック</button>
-                <button id=\"browserWait\" style=\"margin-left:6px;\">待機(500ms)</button>
+                <button id=\"browserClick\">要素をクリック</button>
+                <button id=\"browserWait\" style=\"margin-left:6px;\">0.5秒待機</button>
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
                 <input id=\"browserText\" placeholder=\"入力テキスト\" />
-                <button id=\"browserType\" style=\"margin-left:6px;\">入力</button>
+                <button id=\"browserType\" style=\"margin-left:6px;\">要素に入力</button>
                 <label class=\"muted\" style=\"margin-left:6px;\"><input id=\"browserEnter\" type=\"checkbox\" /> Enter</label>
             </div>
             <div class=\"row\" style=\"margin-top:8px;\">
-                <button id=\"browserTextGet\">テキスト取得</button>
-                <button id=\"browserShot\" style=\"margin-left:6px;\">スクショ</button>
+                <button id=\"browserTextGet\">ページ文字を取得</button>
+                <button id=\"browserShot\" style=\"margin-left:6px;\">画面を保存</button>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">robots.txtや利用規約を尊重して操作してください</div>
             <div class=\"result\" id=\"browserOut\"></div>
@@ -871,8 +1140,8 @@ async def mobile_ui():
         <div id=\"index\" class=\"panel\">
             <div class=\"row\">
                 <input id=\"indexMaxFiles\" type=\"number\" value=\"500\" min=\"1\" />
-                <button id=\"indexRepo\" style=\"margin-left:6px;\">リポジトリ索引</button>
-                <button id=\"indexStatus\" style=\"margin-left:6px;\">状態</button>
+                <button id=\"indexRepo\" style=\"margin-left:6px;\">リポジトリを索引化</button>
+                <button id=\"indexStatus\" style=\"margin-left:6px;\">索引状態を表示</button>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">.py/.md/.txt/.json/.yml/.yaml を索引化</div>
             <div class=\"result\" id=\"indexOut\"></div>
@@ -880,8 +1149,8 @@ async def mobile_ui():
 
         <div id=\"quality\" class=\"panel\">
             <div class=\"row\">
-                <button id=\"qualityRun\">品質チェック実行</button>
-                <button id=\"qualityStatus\" style=\"margin-left:6px;\">状態</button>
+                <button id=\"qualityRun\">品質チェックを実行</button>
+                <button id=\"qualityStatus\" style=\"margin-left:6px;\">品質チェック状態を表示</button>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">compileall / pytest (存在時) を実行</div>
             <div class=\"result\" id=\"qualityOut\"></div>
@@ -890,7 +1159,7 @@ async def mobile_ui():
         <div id=\"search\" class=\"panel\">
             <div class=\"row\">
                 <input id=\"searchQuery\" placeholder=\"検索キーワード\" />
-                <button id=\"searchBtn\" style=\"margin-left:6px;\">検索</button>
+                <button id=\"searchBtn\" style=\"margin-left:6px;\">テキスト検索を実行</button>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">リポジトリ内のテキスト検索</div>
             <div class=\"row\" style=\"margin-top:8px;\">
@@ -903,7 +1172,7 @@ async def mobile_ui():
         <div id=\"ide\" class=\"panel\">
             <div class=\"row\">
                 <input id=\"ideQuery\" placeholder=\"コード検索キーワード\" />
-                <button id=\"ideSearch\" style=\"margin-left:6px;\">検索</button>
+                <button id=\"ideSearch\" style=\"margin-left:6px;\">コード検索を実行</button>
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">コード説明/提案/適用/履歴管理</div>
             <div class=\"row\" style=\"margin-top:8px;\">
@@ -914,11 +1183,11 @@ async def mobile_ui():
                 <input id=\"ideEnd\" type=\"number\" value=\"200\" min=\"1\" style=\"margin-left:6px;\" />
             </div>
             <textarea id=\"ideQuestion\" rows=\"3\" placeholder=\"何を知りたいか (任意)\" style=\"margin-top:8px;\"></textarea>
-            <button id=\"ideExplain\" style=\"margin-top:8px;\">説明</button>
+            <button id=\"ideExplain\" style=\"margin-top:8px;\">コードを説明</button>
             <textarea id=\"ideInstruction\" rows=\"3\" placeholder=\"提案したい変更内容\" style=\"margin-top:8px;\"></textarea>
-            <button id=\"ideSuggest\" style=\"margin-top:8px;\">提案と差分</button>
+            <button id=\"ideSuggest\" style=\"margin-top:8px;\">変更案と差分を作成</button>
             <textarea id=\"ideNewCode\" rows=\"6\" placeholder=\"適用する新しいコード（提案結果を貼り付け）\" style=\"margin-top:8px;\"></textarea>
-            <button id=\"ideApply\" style=\"margin-top:8px;\">適用</button>
+            <button id=\"ideApply\" style=\"margin-top:8px;\">コード変更を適用</button>
             <div class=\"row\" style=\"margin-top:8px;\">
                 <input id=\"ideDiffLimit\" type=\"number\" value=\"20\" min=\"1\" />
                 <input id=\"ideDiffMaxLines\" type=\"number\" value=\"200\" min=\"1\" style=\"margin-left:6px;\" />
@@ -930,19 +1199,19 @@ async def mobile_ui():
                 </select>
             </div>
             <input id=\"ideDiffFilter\" placeholder=\"ファイル名フィルタ (任意)\" style=\"margin-top:8px;\" />
-            <button id=\"ideDiffSummary\" style=\"margin-top:8px;\">差分一覧</button>
-            <button id=\"ideHistory\" style=\"margin-top:8px;\">履歴/バックアップ</button>
+            <button id=\"ideDiffSummary\" style=\"margin-top:8px;\">差分一覧を表示</button>
+            <button id=\"ideHistory\" style=\"margin-top:8px;\">適用履歴を表示</button>
             <input id=\"ideBackup\" placeholder=\"復元するバックアップファイル\" style=\"margin-top:8px;\" />
-            <button id=\"ideRestore\" style=\"margin-top:8px;\">復元</button>
+            <button id=\"ideRestore\" style=\"margin-top:8px;\">バックアップを復元</button>
             <div class=\"result\" id=\"ideOut\"></div>
         </div>
 
         <div id=\"patch\" class=\"panel\">
-            <button id=\"patchList\">一覧を取得</button>
+            <button id=\"patchList\">提案パッチ一覧を表示</button>
             <div class=\"muted\" style=\"margin-top:6px;\">提案パッチの確認と承認</div>
             <div class=\"row\" style=\"margin-top:8px;\">
                 <input id=\"patchId\" placeholder=\"patch_id\" />
-                <button id=\"patchApprove\">承認を実行</button>
+                <button id=\"patchApprove\">パッチを承認</button>
             </div>
             <div class=\"result\" id=\"patchOut\"></div>
         </div>
@@ -953,26 +1222,15 @@ async def mobile_ui():
             </div>
             <div class=\"muted\" style=\"margin-top:6px;\">機能提案の作成/承認</div>
             <textarea id=\"featureDesc\" rows=\"3\" placeholder=\"追加機能の内容\" style=\"margin-top:8px;\"></textarea>
-            <button id=\"featurePropose\" style=\"margin-top:8px;\">提案を作成</button>
-            <div class=\"row\" style=\"margin-top:8px;\">
+            <div class=\"row two-col\" style=\"margin-top:8px;\">
+                <button id=\"featurePropose\">機能提案を作成</button>
+                <button id=\"featureList\">提案一覧を表示</button>
+            </div>
             <div class=\"row two-col\" style=\"margin-top:8px;\">
                 <input id=\"featureId\" placeholder=\"proposal_id\" />
-                <button id=\"featureApprove\">承認</button>
+                <button id=\"featureApprove\">提案を承認</button>
             </div>
-            <div class=\"row two-col\" style=\"margin-top:8px;\">
-                <button id=\"localRun\">ローカル学習を実行</button>
-                <button id=\"localStatus\">状態</button>
-            </div>
-            <div class=\"row three-col\" style=\"margin-top:8px;\">
-                <button id=\"ocrWatchStart\">監視開始</button>
-                <button id=\"ocrWatchStop\">監視停止</button>
-                <button id=\"ocrWatchStatus\">監視状態</button>
-            </div>
-                <button id=\"logTail\">最新ログ取得</button>
-                <input id=\"logSearch\" placeholder=\"検索キーワード\" />
-                <button id=\"logSearchBtn\">検索</button>
-            </div>
-            <div class=\"result\" id=\"logOut\"></div>
+            <div class=\"result\" id=\"featureOut\"></div>
         </div>
 
         <div id=\"dash\" class=\"panel\">
@@ -985,6 +1243,10 @@ async def mobile_ui():
 
     <div class=\"footer\">
         <div class=\"muted\">/ui からアクセス（同一LAN内）</div>
+        <div class=\"marker-wrap\">
+            <div id=\"runMarker\" class=\"marker marker-warn\">状態: 初期化中</div>
+            <div id=\"runMarkerDetail\" class=\"muted\">学習/監視状態を確認中...</div>
+        </div>
         <div id=\"inputDock\" class=\"dock\" style=\"margin-top:8px;\"></div>
         <div id=\"statusToast\" class=\"muted\" style=\"margin-top:4px;\">状態: 読み込み中...</div>
         <div id=\"jsBoot\" class=\"muted\" style=\"margin-top:4px;\">JS: 未実行</div>
@@ -1010,6 +1272,43 @@ async def mobile_ui():
     }
     function byId(id){ return document.getElementById(id) || _dummyEl(); }
     function setStatus(msg){ byId('statusToast').textContent = '状態: ' + msg; }
+    function setRunMarker(kind, text, detail){
+        var marker = byId('runMarker');
+        var markerDetail = byId('runMarkerDetail');
+        marker.className = 'marker';
+        if (kind === 'ok') marker.classList.add('marker-ok');
+        else if (kind === 'busy') marker.classList.add('marker-busy');
+        else if (kind === 'err') marker.classList.add('marker-err');
+        else marker.classList.add('marker-warn');
+        marker.textContent = text || '状態: 不明';
+        markerDetail.textContent = detail || '';
+    }
+
+    function refreshRunMarker(){
+        api('/api/local/status','GET',null,function(localData){
+            api('/api/ocr/watch/status','GET',null,function(watchData){
+                var localState = (localData && localData.state) ? localData.state : {};
+                var watchState = (watchData && watchData.state) ? watchData.state : {};
+                var localRunning = !!localState.running;
+                var watchRunning = !!watchState.running;
+                var err = localState.last_error || watchState.last_error || '';
+
+                if (err){
+                    setRunMarker('err', '状態: エラー', String(err).slice(0, 120));
+                    return;
+                }
+                if (localRunning){
+                    setRunMarker('busy', '状態: 学習実行中', 'ローカル取り込みが動作中');
+                    return;
+                }
+                if (watchRunning){
+                    setRunMarker('busy', '状態: OCR監視中', '監視ディレクトリのOCR学習待機中');
+                    return;
+                }
+                setRunMarker('ok', '状態: 停止/待機', '監視・学習は現在停止しています');
+            });
+        });
+    }
     function escapeHtml(str){
         return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
@@ -1042,12 +1341,13 @@ async def mobile_ui():
                     catch(e){ cb({}); }
                 } else {
                     setStatus('通信エラー ' + xhr.status);
+                    setRunMarker('err', '状態: 通信エラー', 'API通信に失敗しました: ' + xhr.status);
                     try { cb(JSON.parse(xhr.responseText || '{}')); }
                     catch(e){ cb({}); }
                 }
             }
         };
-        xhr.onerror = function(){ setStatus('通信エラー'); };
+        xhr.onerror = function(){ setStatus('通信エラー'); setRunMarker('err', '状態: 通信エラー', 'API通信に失敗しました'); };
         xhr.send(body ? JSON.stringify(body) : null);
     }
 
@@ -1061,12 +1361,13 @@ async def mobile_ui():
                     catch(e){ cb({}); }
                 } else {
                     setStatus('通信エラー ' + xhr.status);
+                    setRunMarker('err', '状態: 通信エラー', 'API通信に失敗しました: ' + xhr.status);
                     try { cb(JSON.parse(xhr.responseText || '{}')); }
                     catch(e){ cb({}); }
                 }
             }
         };
-        xhr.onerror = function(){ setStatus('通信エラー'); };
+        xhr.onerror = function(){ setStatus('通信エラー'); setRunMarker('err', '状態: 通信エラー', 'API通信に失敗しました'); };
         xhr.send(formData);
     }
 
@@ -1112,6 +1413,14 @@ async def mobile_ui():
     function dockPanel(panelId){
         var dock = byId('inputDock');
         if (!dock || !panelId) return;
+
+        if (panelId !== 'chat'){
+            restoreAllDocked();
+            dock.classList.add('hidden');
+            return;
+        }
+
+        dock.classList.remove('hidden');
         restoreAllDocked();
         var panel = byId(panelId);
         var nodes = collectDockNodes(panel);
@@ -1147,6 +1456,7 @@ async def mobile_ui():
         var jsBoot = byId('jsBoot');
         if (jsBoot) jsBoot.textContent = 'JS: 起動';
         setStatus('UI準備完了');
+        setRunMarker('warn', '状態: 初期化中', '接続と稼働状態を確認しています');
         var themeSelect = byId('uiTheme');
         var themeApply = byId('uiThemeApply');
         var currentTheme = getTheme();
@@ -1159,10 +1469,19 @@ async def mobile_ui():
             setStatus('テーマ変更済み');
         };
         api('/api/ping','GET',null,function(data){
-            if (data && data.ok) setStatus('接続OK');
+            if (data && data.ok) {
+                setStatus('接続OK');
+                refreshRunMarker();
+            }
         });
+        setInterval(refreshRunMarker, 8000);
         dockPanel('chat');
-        newTopic();
+        currentTopicId = null;
+        setTimeout(function(){
+            if (chatContinue) chatContinue.checked = false;
+            setChatLog([]);
+            loadTopics();
+        }, 0);
     }
 
     if (document.readyState === 'loading') {
@@ -1172,20 +1491,71 @@ async def mobile_ui():
     }
 
     try {
-        var tabs = document.querySelectorAll('.tab');
-        for (var i=0;i<tabs.length;i++){
-            tabs[i].onclick = (function(t){
-                return function(){
-                    for (var j=0;j<tabs.length;j++){ tabs[j].classList.remove('active'); }
-                    t.classList.add('active');
-                    var panels = document.querySelectorAll('.panel');
-                    for (var k=0;k<panels.length;k++){ panels[k].classList.remove('active'); }
-                    var id = t.getAttribute('data-tab');
-                    byId(id).classList.add('active');
-                    dockPanel(id);
-                };
-            })(tabs[i]);
+        var groupButtons = document.querySelectorAll('.menu-group-btn');
+        var subTabs = document.querySelectorAll('.subtab');
+        var currentGroup = 'assistant';
+        var currentTab = 'chat';
+
+        function activateTab(tabId){
+            if (!tabId) return;
+            for (var i=0;i<subTabs.length;i++){
+                subTabs[i].classList.remove('active');
+                if (subTabs[i].getAttribute('data-tab') === tabId){
+                    subTabs[i].classList.add('active');
+                }
+            }
+            var panels = document.querySelectorAll('.panel');
+            for (var j=0;j<panels.length;j++){ panels[j].classList.remove('active'); }
+            byId(tabId).classList.add('active');
+            dockPanel(tabId);
+            currentTab = tabId;
         }
+
+        function activateGroup(groupId){
+            if (!groupId) return;
+            currentGroup = groupId;
+            for (var i=0;i<groupButtons.length;i++){
+                groupButtons[i].classList.toggle('active', groupButtons[i].getAttribute('data-group') === groupId);
+            }
+
+            var firstVisibleTab = null;
+            var hasCurrentInGroup = false;
+            for (var k=0;k<subTabs.length;k++){
+                var matches = subTabs[k].getAttribute('data-group') === groupId;
+                subTabs[k].classList.toggle('hidden', !matches);
+                if (matches && !firstVisibleTab){
+                    firstVisibleTab = subTabs[k].getAttribute('data-tab');
+                }
+                if (matches && subTabs[k].getAttribute('data-tab') === currentTab){
+                    hasCurrentInGroup = true;
+                }
+            }
+
+            if (!hasCurrentInGroup && firstVisibleTab){
+                activateTab(firstVisibleTab);
+            }
+        }
+
+        for (var g=0;g<groupButtons.length;g++){
+            groupButtons[g].onclick = (function(btn){
+                return function(){ activateGroup(btn.getAttribute('data-group')); };
+            })(groupButtons[g]);
+        }
+
+        for (var s=0;s<subTabs.length;s++){
+            subTabs[s].onclick = (function(tabBtn){
+                return function(){
+                    var groupId = tabBtn.getAttribute('data-group');
+                    if (groupId !== currentGroup){
+                        activateGroup(groupId);
+                    }
+                    activateTab(tabBtn.getAttribute('data-tab'));
+                };
+            })(subTabs[s]);
+        }
+
+        activateGroup('assistant');
+        activateTab('chat');
     } catch (e) {
         setStatus('エラー: ' + (e && e.message ? e.message : e));
     }
@@ -1288,7 +1658,7 @@ async def mobile_ui():
     }
 
     function newTopic(){
-        api('/api/chat/new','POST',null,function(data){
+        api('/api/chat/new','POST',{user_action: true},function(data){
             if (data.topic && data.topic.id){
                 currentTopicId = data.topic.id;
                 setChatLog([]);
@@ -1311,7 +1681,7 @@ async def mobile_ui():
         chatInput.value = '';
         setStatus('チャット送信中...');
         var forceNew = !(chatContinue && chatContinue.checked);
-        api('/api/chat/send','POST',{message: msg, topic_id: currentTopicId, force_new: forceNew}, function(data){
+        api('/api/chat/send','POST',{message: msg, topic_id: currentTopicId, force_new: forceNew, user_action: true}, function(data){
             addBubble(data.response || '（応答なし）', 'ai');
             if (data.topic && data.topic.id){
                 currentTopicId = data.topic.id;
@@ -1544,16 +1914,86 @@ async def mobile_ui():
     };
 
     // Local OCR ingest
+    function _localBool(flag){ return flag ? 'ON' : 'OFF'; }
+    function _safeText(v){ return (v === null || v === undefined) ? '' : String(v); }
+
+    function renderLocalBoard(phase, detail, modeRows){
+        var board = byId('localStateBoard');
+        if (!board) return;
+        var html = '';
+        html += renderCard('OCR/学習ステータス', renderKV({
+            状態: phase || '待機',
+            詳細: detail || '操作を待機しています'
+        }));
+        html += renderCard('現在の設定', renderKV(modeRows || {}));
+        board.innerHTML = html;
+    }
+
+    function refreshLocalBoardIdle(){
+        var summarizeOn = !!byId('ocrSummary').checked;
+        var rebuildOn = !!byId('localRebuild').checked;
+        var minChars = parseInt(byId('ocrMinChars').value || '40', 10);
+        renderLocalBoard('待機', 'OCRファイル選択または監視操作を実行してください', {
+            OCR要約: _localBool(summarizeOn),
+            ベクトル再構築: _localBool(rebuildOn),
+            学習最小文字数: isNaN(minChars) ? '40' : String(minChars)
+        });
+    }
+
     function renderLocalStatus(data){
         var out = byId('localOut');
         if (!data){ out.innerHTML = '<div class="card">情報なし</div>'; return; }
+        var phase = '待機';
+        var detail = '操作を待機しています';
+        if (data.state && data.state.running){
+            phase = '実行中';
+            detail = '監視または学習タスクが動作しています';
+        }
+        if (data.started){
+            phase = '監視開始';
+            detail = 'OCR監視を開始しました';
+        }
+        if (data.stopped){
+            phase = '監視停止';
+            detail = 'OCR監視を停止しました';
+        }
+        if (data.learned){
+            phase = '学習成功';
+            detail = 'OCR結果を学習データへ保存しました';
+        }
+        if (data.text && !data.learned && !data.skipped){
+            phase = '検出成功';
+            detail = 'OCRで文字を検出しました';
+        }
+        if (data.skipped){
+            phase = '学習スキップ';
+            detail = '文字数条件を満たさないため学習をスキップしました';
+        }
+        if (data.ok === false && !data.skipped){
+            phase = '失敗';
+            detail = _safeText(data.reason || data.error || '処理に失敗しました');
+        }
+
+        var summarizeOn = !!byId('ocrSummary').checked;
+        var rebuildOn = !!byId('localRebuild').checked;
+        var minChars = parseInt(byId('ocrMinChars').value || '40', 10);
+        renderLocalBoard(phase, detail, {
+            OCR要約: _localBool(summarizeOn),
+            ベクトル再構築: _localBool(rebuildOn),
+            学習最小文字数: isNaN(minChars) ? '40' : String(minChars)
+        });
+
         var html = '';
-        if (data.state){ html += renderCard('実行状態', renderKV(data.state)); }
-        if (data.last_state){ html += renderCard('前回結果', renderKV(data.last_state)); }
-        if (data.ocr){ html += renderCard('OCR設定', renderKV(data.ocr)); }
-        if (data.text){ html += renderCard('OCR結果', '<pre>' + escapeHtml(data.text) + '</pre>'); }
+        if (data.text){
+            html += renderCard('検出テキスト', '<pre>' + escapeHtml(_safeText(data.text)) + '</pre>');
+            html += renderCard('検出情報', renderKV({文字数: _safeText(data.text).length}));
+        }
+        if (data.summary){ html += renderCard('要約結果', '<pre>' + escapeHtml(data.summary) + '</pre>'); }
         if (data.clean_file){ html += renderCard('学習保存先', renderKV({file: data.clean_file})); }
-        out.innerHTML = html || '<div class="card">情報なし</div>';
+        if (data.skipped){ html += renderCard('スキップ理由', renderKV({理由: data.reason || '条件不一致', 必要文字数: data.min_chars || '', 実際文字数: data.text_chars || ''})); }
+        if (data.state && data.state.last_error){ html += renderCard('エラー', renderKV({message: data.state.last_error})); }
+        if (data.last_error){ html += renderCard('エラー', renderKV({message: data.last_error})); }
+        out.innerHTML = html || '<div class="card">まだ結果はありません（操作後に表示）</div>';
     }
     byId('localStatus').onclick = function(){
         setStatus('ローカル学習の状態取得中...');
@@ -1562,13 +2002,47 @@ async def mobile_ui():
             setStatus('ローカル学習の状態取得完了');
         });
     };
+    byId('ocrRecent').onclick = function(){
+        setStatus('最近のOCR検出を取得中...');
+        api('/api/ocr/recent','GET',null,function(data){
+            var out = byId('localOut');
+            var html = '';
+            var last = (data && data.last_result) ? data.last_result : null;
+            if (last){
+                var cap = last.capture || {};
+                var info = {};
+                if (typeof last.processed !== 'undefined') info.processed = last.processed;
+                if (typeof last.added !== 'undefined') info.added = last.added;
+                if (cap.file) info.file = cap.file;
+                if (cap.backend) info.backend = cap.backend;
+                html += renderCard('最新OCR監視結果', renderKV(info));
+            } else {
+                html += '<div class="card">最近の結果はありません</div>';
+            }
+            var list = (data && data.recent_clean) ? data.recent_clean : [];
+            if (list.length){
+                var cards = '';
+                for (var i=0;i<list.length;i++){
+                    var it = list[i];
+                    cards += '<div class="card"><h4>' + escapeHtml((it.file||'').split('/').pop()) + '</h4>'
+                        + '<div style="white-space:pre-wrap;font-size:12px;">' + escapeHtml(it.snippet || '') + '</div>'
+                        + '</div>';
+                }
+                html += renderCard('学習済みファイル（最新）', cards);
+            }
+            out.innerHTML = html;
+            setStatus('最近のOCR検出取得完了');
+        });
+    };
     byId('localRun').onclick = function(){
         var force = !!byId('localForce').checked;
         var rebuild = !!byId('localRebuild').checked;
         setStatus('ローカル学習を実行中...');
+        setRunMarker('busy', '状態: 学習開始', 'ローカル取り込みを開始しました');
         api('/api/local/ingest','POST',{force: force, rebuild: rebuild},function(data){
             renderLocalStatus(data);
             setStatus('ローカル学習実行完了');
+            refreshRunMarker();
         });
     };
 
@@ -1576,34 +2050,43 @@ async def mobile_ui():
         var file = byId('ocrFile').files[0];
         if (!file) return;
         setStatus('OCR実行中...');
+        setRunMarker('busy', '状態: OCR実行中', 'OCRで文字認識しています');
         var fd = new FormData();
         fd.append('file', file);
         fd.append('learn', 'false');
         fd.append('rebuild', 'false');
+        fd.append('summarize', String(!!byId('ocrSummary').checked));
         upload('/api/ocr/upload', fd, function(data){
             renderLocalStatus(data);
             setStatus('OCR完了');
+            refreshRunMarker();
         });
     };
     byId('ocrUploadLearn').onclick = function(){
         var file = byId('ocrFile').files[0];
         if (!file) return;
         setStatus('OCRして学習中...');
+        setRunMarker('busy', '状態: OCR学習中', 'OCR結果を学習データへ反映中');
         var fd = new FormData();
         fd.append('file', file);
         fd.append('learn', 'true');
         fd.append('rebuild', String(!!byId('localRebuild').checked));
+        fd.append('summarize', String(!!byId('ocrSummary').checked));
+        fd.append('min_chars', String(parseInt(byId('ocrMinChars').value || '40', 10)));
         upload('/api/ocr/upload', fd, function(data){
             renderLocalStatus(data);
             setStatus('OCR学習完了');
+            refreshRunMarker();
         });
     };
 
     byId('ocrWatchStart').onclick = function(){
         setStatus('OCR監視開始中...');
+        setRunMarker('busy', '状態: OCR監視開始中', '監視サービスを起動しています');
         api('/api/ocr/watch/start','POST',null,function(data){
             renderLocalStatus(data);
             setStatus('OCR監視開始');
+            refreshRunMarker();
         });
     };
     byId('ocrWatchStop').onclick = function(){
@@ -1611,6 +2094,7 @@ async def mobile_ui():
         api('/api/ocr/watch/stop','POST',null,function(data){
             renderLocalStatus(data);
             setStatus('OCR監視停止');
+            refreshRunMarker();
         });
     };
     byId('ocrWatchStatus').onclick = function(){
@@ -1618,8 +2102,14 @@ async def mobile_ui():
         api('/api/ocr/watch/status','GET',null,function(data){
             renderLocalStatus(data);
             setStatus('OCR監視状態取得完了');
+            refreshRunMarker();
         });
     };
+
+    byId('ocrSummary').onchange = refreshLocalBoardIdle;
+    byId('localRebuild').onchange = refreshLocalBoardIdle;
+    byId('ocrMinChars').oninput = refreshLocalBoardIdle;
+    refreshLocalBoardIdle();
 
     // Browser automation
     function renderBrowserOut(data){
@@ -2429,6 +2919,8 @@ async def ocr_upload_api(
     file: UploadFile = File(...),
     learn: bool = Form(True),
     rebuild: bool = Form(True),
+    summarize: bool = Form(False),
+    min_chars: int = Form(40),
     x_api_key: str = Header(default=None),
 ):
     _check_token(x_api_key)
@@ -2442,44 +2934,57 @@ async def ocr_upload_api(
     content = await file.read()
     out_path.write_bytes(content)
 
-    if not learn:
-        text = process_image_for_learning(out_path, rebuild=False).get("text", "")
-        return {"ok": True, "text": text, "file": str(out_path)}
+    text = ocr_image_file(out_path)
+    if not text:
+        return {"ok": False, "reason": "empty_text", "file": str(out_path)}
 
-    result = process_image_for_learning(out_path, rebuild=rebuild)
-    result.update({"file": str(out_path)})
-    return result
+    response = {"ok": True, "text": text, "file": str(out_path)}
+    if summarize:
+        response["summary"] = assistant.summarize_text(text)
+
+    if not learn:
+        return response
+
+    threshold = max(1, int(min_chars or 1))
+    if len(text) < threshold:
+        response.update({
+            "ok": False,
+            "skipped": True,
+            "reason": "text_too_short",
+            "min_chars": threshold,
+            "text_chars": len(text),
+        })
+        return response
+
+    clean_dir = Config.DATA_DIR / "clean"
+    clean_dir.mkdir(parents=True, exist_ok=True)
+    doc_id = hashlib.sha256(str(out_path).encode("utf-8")).hexdigest()[:16]
+    clean_path = clean_dir / f"local_{doc_id}.txt"
+    clean_path.write_text(text, encoding="utf-8")
+
+    response.update({"clean_file": str(clean_path), "learned": True})
+    if rebuild:
+        response["vector_store"] = build_vector_store_from_clean()
+    return response
 
 
 @app.post("/api/ocr/watch/start")
 async def ocr_watch_start_api(x_api_key: str = Header(default=None)):
     _check_token(x_api_key)
-    global _ocr_watch_thread
-    if ocr_watch_state["running"]:
-        return {"started": False, "state": ocr_watch_state}
-
-    ocr_watch_state["running"] = True
-    ocr_watch_state["last_error"] = None
-    ocr_watch_state["updated_at"] = int(time.time())
-
-    def _loop():
-        while ocr_watch_state.get("running"):
-            try:
-                res = ingest_images_from_dirs(Config.OCR_WATCH_DIRS, rebuild=False)
-                ocr_watch_state["last_result"] = res
-            except Exception as e:
-                ocr_watch_state["last_error"] = str(e)
-            ocr_watch_state["updated_at"] = int(time.time())
-            time.sleep(max(5, int(Config.OCR_WATCH_INTERVAL_SECONDS or 60)))
-
-    _ocr_watch_thread = threading.Thread(target=_loop, daemon=True)
-    _ocr_watch_thread.start()
-    return {"started": True, "state": ocr_watch_state}
+    # persist user's intent to auto-start so it survives client disconnects
+    cfg = _load_ocr_watch_config()
+    cfg["auto_start"] = True
+    _save_ocr_watch_config(cfg)
+    return _start_ocr_watch_background()
 
 
 @app.post("/api/ocr/watch/stop")
 async def ocr_watch_stop_api(x_api_key: str = Header(default=None)):
     _check_token(x_api_key)
+    # clear persisted auto-start intent
+    cfg = _load_ocr_watch_config()
+    cfg["auto_start"] = False
+    _save_ocr_watch_config(cfg)
     ocr_watch_state["running"] = False
     ocr_watch_state["updated_at"] = int(time.time())
     return {"stopped": True, "state": ocr_watch_state}
@@ -2488,7 +2993,39 @@ async def ocr_watch_stop_api(x_api_key: str = Header(default=None)):
 @app.get("/api/ocr/watch/status")
 async def ocr_watch_status_api(x_api_key: str = Header(default=None)):
     _check_token(x_api_key)
-    return {"state": ocr_watch_state, "dirs": [str(p) for p in Config.OCR_WATCH_DIRS]}
+    cfg = _load_ocr_watch_config()
+    return {
+        "state": ocr_watch_state,
+        "dirs": [str(p) for p in Config.OCR_WATCH_DIRS],
+        "capture_screen": bool(getattr(Config, "OCR_WATCH_CAPTURE_SCREEN", True)),
+        "capture_backend": getattr(Config, "OCR_WATCH_CAPTURE_BACKEND", "auto"),
+        "capture_fps": float(getattr(Config, "OCR_WATCH_CAPTURE_FPS", 1.0)),
+        "auto_start": bool(cfg.get("auto_start", False)),
+    }
+
+
+@app.get("/api/ocr/recent")
+async def ocr_recent_api(x_api_key: str = Header(default=None)):
+    _check_token(x_api_key)
+    # return last watch result and recent clean files (latest 10)
+    watch = ocr_watch_state
+    last = watch.get("last_result")
+    recent = []
+    try:
+        clean_dir = Config.DATA_DIR / "clean"
+        if clean_dir.exists():
+            files = [p for p in clean_dir.iterdir() if p.suffix == ".txt"]
+            files = sorted(files, key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)[:10]
+            for p in files:
+                try:
+                    text = p.read_text(encoding='utf-8', errors='ignore')
+                    snippet = (text or "")[:1000]
+                    recent.append({"file": str(p), "mtime": p.stat().st_mtime, "snippet": snippet})
+                except Exception:
+                    continue
+    except Exception:
+        recent = []
+    return {"watch_state": watch, "last_result": last, "recent_clean": recent}
 
 
 @app.get("/api/local/status")
@@ -2892,6 +3429,13 @@ async def assist_restore_api(req: RestoreRequest, x_api_key: str = Header(defaul
     return {"restored": True, "file": req.file, "backup": req.backup}
 
 if __name__ == '__main__':
+    # On import/start, respect persisted OCR watch auto_start flag
+    try:
+        cfg = _load_ocr_watch_config()
+        if cfg.get("auto_start", False):
+            _start_ocr_watch_background()
+    except Exception:
+        pass
     import uvicorn
     reload_enabled = os.getenv("AI_ASSISTANT_API_RELOAD", "1") == "1"
     if reload_enabled:
