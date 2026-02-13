@@ -50,8 +50,8 @@ class Config:
     
     # API configuration
     OLLAMA_BASE_URL = "http://localhost:11434"
-    API_PORT = 8000
-    API_HOST = "0.0.0.0"
+    API_PORT = int(os.getenv("AI_ASSISTANT_API_PORT", "8000"))
+    API_HOST = os.getenv("AI_ASSISTANT_API_HOST", "192.168.1.11")
     API_TOKEN = os.getenv("AI_ASSISTANT_API_TOKEN", "")  # 任意: 外部アクセス時の簡易トークン
     API_ALLOWED_IPS = [ip.strip() for ip in os.getenv("AI_ASSISTANT_ALLOWED_IPS", "").split(",") if ip.strip()]
 

@@ -6,6 +6,7 @@ import threading
 import time
 import shutil
 from pathlib import Path
+import os
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -2892,4 +2893,8 @@ async def assist_restore_api(req: RestoreRequest, x_api_key: str = Header(defaul
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8000)
+    reload_enabled = os.getenv("AI_ASSISTANT_API_RELOAD", "1") == "1"
+    if reload_enabled:
+        uvicorn.run("api:app", host=Config.API_HOST, port=Config.API_PORT, reload=True)
+    else:
+        uvicorn.run(app, host=Config.API_HOST, port=Config.API_PORT)

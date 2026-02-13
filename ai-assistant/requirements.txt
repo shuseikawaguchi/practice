@@ -1,5 +1,5 @@
 transformers==4.35.2
-torch==2.0.1
+torch>=2.0.1
 ollama==0.1.0
 fastapi==0.104.1
 uvicorn==0.24.0
@@ -19,4 +19,6 @@ sacrebleu==2.3.1
 rouge-score==0.1.2
 pillow==10.2.0
 pytesseract==0.3.10
+pyautogui==0.9.54
+opencv-python==4.9.0.80
 playwright==1.49.0
